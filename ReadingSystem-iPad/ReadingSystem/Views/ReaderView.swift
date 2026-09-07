@@ -1,68 +1,39 @@
-// ReaderView.swift — Block/Node 共用 Reader（Phase A + Phase B）
-// 单一 Canonical Coordinate Space：TextSurface 与 PKCanvasView 同 frame/origin
-//
-// 视图层级：
-// GeometryReader → ScrollView → VStack → header + CanonicalBodyView
-//   CanonicalBodyView = ZStack(.topLeading) { TextSurface + PKCanvasView }
-//   padding 在 ZStack 外层 → Text 和 Canvas 共享同一坐标原点
-//   InkToolbar 是 screen overlay，不参与 CanonicalDocument layout
-//
-// Phase A 修复：
-// 1. Text 和 Canvas 共享 padding/origin
-// 2. PKCanvasView: identity transform, zoomScale=1, contentOffset=zero
-// 3. LayoutProfile 锁定（有 Ink 时锁定）
-// 4. Hover/Stroke 期间布局冻结
-// 5. Debug 几何断言 + overlay
-//
-// Phase B 工具系统：
-// 6. InkToolController 唯一工具状态真源
-// 7. 圆形按钮 + 纵向 palette + 属性面板
-// 8. Apple Pencil 双击（UIPencilInteraction）
-// 9. stroke active 时工具切换排队
+// ReaderView.swift — Block/Node 共用 Reader（dev.ipad_reader）
+// 页面层级：Chrome → Document Viewport → Metadata Header + Canonical Body Surface（Text Layer + Ink Layer）。
+// Header 与 Body 坐标分离：Header 高度变化不移动 Body 原点（viewport anchor compensation 由 ScrollView 保持）。
+// continuous vertical canvas、固定 canonical width；EXTEND 只在底部 append；
+// 用户不在底部时不 auto-scroll，显示「新增内容 ↓」；滚到底绝不自动 END。
 
 import SwiftUI
 import PencilKit
 
 struct ReaderView: View {
     let graphId: String
-    let viewKind: String
-    let entity: NodeDTO?
+    let viewKind: String                 // BLOCK_VIEW | NODE_VIEW
+    let entity: NodeDTO?                 // NODE_VIEW 时的焦点节点
     let snapshot: ContentSnapshot?
     let previousSegmentCount: Int
-    let annotationHandler: (String, Data) -> Void
+    let annotationHandler: (String, Data) -> Void   // entityId, PKDrawing data
 
     @State private var showInk = true
     @State private var lastSegmentCount = 0
     @State private var hasNewContent = false
 
-    // Phase A: LayoutProfile 锁定
-    @State private var lockedProfile: LayoutProfile?
-
-    // Phase A: Hover/Stroke 期间布局冻结 gate
-    @State private var isPencilActive = false
-
-    // Phase B: 工具状态唯一真源
-    @StateObject private var inkTool = InkToolController()
-
-    #if DEBUG
-    @State private var debugData: GeometryDebugData?
-    @State private var showDebugOverlay = false
-    #endif
-
     var body: some View {
         GeometryReader { geo in
-            let profile = lockedProfile ?? LayoutProfile.current(for: geo.size.width)
+            let margin = max(24, geo.size.width * 0.045)            // 两侧留白 ≈ 4.5%（参照 PDF）
+            let fontSize = min(geo.size.width * 0.91 / 30, 34)      // 每行 ≈ 30 字（参照 PDF 18pt 正文）
             ScrollViewReader { proxy in
-                readerBody(profile: profile, proxy: proxy)
+                readerBody(margin: margin, fontSize: fontSize, proxy: proxy)
             }
         }
     }
 
-    private func readerBody(profile: LayoutProfile, proxy: ScrollViewProxy) -> some View {
+    private func readerBody(margin: CGFloat, fontSize: CGFloat, proxy: ScrollViewProxy) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 header
-                canonicalBodySurface(profile: profile)
+                bodySurface(margin: margin, fontSize: fontSize)
                     .id("body-bottom")
             }
         }
@@ -78,27 +49,13 @@ struct ReaderView: View {
                         .background(.thinMaterial, in: Capsule())
                 }
                 .padding()
+                // 只有用户本来就在底部附近才自动跟随；否则保持 viewport（不 auto-scroll）
                 .onAppear { hasNewContent = true }
             }
         }
-        // Phase B: 工具工具栏 overlay（不参与正文 layout）
-        .overlay(alignment: .bottomTrailing) {
-            InkToolbar(controller: inkTool)
-        }
-        // Phase B: 属性面板 overlay
-        .overlay(alignment: .bottom) {
-            if inkTool.attributesExpanded, inkTool.activeTool.isWritingTool {
-                InkAttributesPanel(controller: inkTool)
-                    .padding(.bottom, 70)
-                    .transition(.opacity)
-            }
-        }
-        #if DEBUG
-        .geometryDebugOverlay(enabled: showDebugOverlay, data: debugData)
-        #endif
     }
 
-    /// Metadata Header：Title + Anchor Summary
+    /// Metadata Header：Title + Anchor Summary（与 Body 坐标平面分离，不进 Ink 坐标系）
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             if viewKind == "NODE_VIEW" {
@@ -111,6 +68,7 @@ struct ReaderView: View {
                 }
             } else {
                 Text(snapshot?.rootBlockTitle ?? "").font(.title3.bold())
+                // Fresh Block 不突出系统 Summary：默认不展示 Block Anchor Summary
             }
             Divider()
         }
@@ -119,46 +77,25 @@ struct ReaderView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Canonical Body Surface：Text + Ink 叠加，共享坐标原点
-    private func canonicalBodySurface(profile: LayoutProfile) -> some View {
+    /// Canonical Body Surface：Text Layer + Ink Layer 叠加；固定 canonical width
+    private func bodySurface(margin: CGFloat, fontSize: CGFloat) -> some View {
         let bodyText = bodyTextForView
         return ZStack(alignment: .topLeading) {
+            // Text Layer：selectable / searchable
             Text(bodyText.isEmpty ? "（内容同步中…）" : bodyText)
-                .font(.system(size: profile.fontSize))
+                .font(.system(size: fontSize))
                 .textSelection(.enabled)
-                .lineSpacing(profile.lineSpacing)
-
+                .lineSpacing(fontSize * 0.55)
+                .padding(.vertical, 20)
             if showInk {
-                InkLayerView(
-                    entityId: entityIdForInk,
-                    tool: inkTool.currentPKTool,
-                    toolVersion: inkTool.toolVersion,
-                    onDrawingChange: { data in
-                        annotationHandler(entityIdForInk, data)
-                    },
-                    onInkPresenceChanged: { hasInk in
-                        if hasInk && lockedProfile == nil {
-                            lockedProfile = profile
-                        }
-                    },
-                    onStrokeStateChange: { active in
-                        isPencilActive = active
-                        // stroke 结束 → 应用排队的工具切换
-                        if !active {
-                            inkTool.flushPending()
-                        }
-                    },
-                    onDoubleTap: {
-                        inkTool.handle(.doubleTapEraser, strokeActive: isPencilActive)
-                    },
-                    isPencilActive: $isPencilActive,
-                    onGeometryUpdate: debugGeometryHandler
-                )
+                // Ink Layer：Pencil 落笔即写（pencilOnly；finger 留给滚动/选择）
+                InkLayerView(entityId: entityIdForInk, onDrawingChange: { data in
+                    annotationHandler(entityIdForInk, data)
+                })
                 .transition(.opacity)
             }
         }
-        .padding(.horizontal, profile.margin)
-        .padding(.vertical, 20)
+        .padding(.horizontal, margin)  // 留白参照 PDF ≈ 4.5%；rotation 只改 viewport transform
         .frame(maxWidth: .infinity, alignment: .center)
     }
 
@@ -166,19 +103,13 @@ struct ReaderView: View {
         viewKind == "NODE_VIEW" ? (entity?.id ?? "") : (snapshot?.rootBlockId ?? "")
     }
 
+    /// Node Body：Segment 按序拼接（连续自然文章，不显示 Segment ID、不用聊天气泡）；
+    /// 旧 Segment 文本永不改写（append-only 的阅读面）。
     private var bodyTextForView: String {
         if viewKind == "NODE_VIEW", let node = entity {
             return node.segments.sorted(by: { $0.ordinal < $1.ordinal }).map { $0.text }.joined(separator: "\n\n")
         }
         return snapshot?.rootBlockContent ?? ""
-    }
-
-    private var debugGeometryHandler: ((GeometryDebugData) -> Void)? {
-        #if DEBUG
-        return { data in debugData = data }
-        #else
-        return nil
-        #endif
     }
 }
 
@@ -186,79 +117,37 @@ struct ReaderView: View {
 
 struct InkLayerView: UIViewRepresentable {
     let entityId: String
-    let tool: PKTool
-    let toolVersion: Int
     let onDrawingChange: (Data) -> Void
-    let onInkPresenceChanged: (Bool) -> Void
-    let onStrokeStateChange: (Bool) -> Void
-    let onDoubleTap: () -> Void
-    @Binding var isPencilActive: Bool
-    let onGeometryUpdate: ((GeometryDebugData) -> Void)?
-
-    init(
-        entityId: String,
-        tool: PKTool,
-        toolVersion: Int,
-        onDrawingChange: @escaping (Data) -> Void,
-        onInkPresenceChanged: @escaping (Bool) -> Void,
-        onStrokeStateChange: @escaping (Bool) -> Void,
-        onDoubleTap: @escaping () -> Void,
-        isPencilActive: Binding<Bool>,
-        onGeometryUpdate: ((GeometryDebugData) -> Void)? = nil
-    ) {
-        self.entityId = entityId
-        self.tool = tool
-        self.toolVersion = toolVersion
-        self.onDrawingChange = onDrawingChange
-        self.onInkPresenceChanged = onInkPresenceChanged
-        self.onStrokeStateChange = onStrokeStateChange
-        self.onDoubleTap = onDoubleTap
-        self._isPencilActive = isPencilActive
-        self.onGeometryUpdate = onGeometryUpdate
-    }
 
     func makeUIView(context: Context) -> PKCanvasView {
         let canvas = PKCanvasView()
-        canvas.drawingPolicy = .pencilOnly
+        canvas.drawingPolicy = .pencilOnly      // Pencil 落笔即写；finger 留给 scroll/selection
         canvas.backgroundColor = .clear
         canvas.isOpaque = false
         canvas.delegate = context.coordinator
-
-        // Phase A: 锁死画布内部 scroll/zoom
+        // 锁死画布内部滚动：PKCanvasView 是 UIScrollView，内部 offset 一旦变化，
+        // 笔迹会相对正文整体漂移（表现为笔尖靠近错位、移开复位）。坐标必须恒定。
         canvas.isScrollEnabled = false
         canvas.alwaysBounceVertical = false
         canvas.alwaysBounceHorizontal = false
         canvas.contentInsetAdjustmentBehavior = .never
         canvas.contentInset = .zero
         canvas.contentOffset = .zero
-        canvas.minimumZoomScale = 1
-        canvas.maximumZoomScale = 1
-        canvas.zoomScale = 1
-        canvas.transform = .identity
         canvas.showsVerticalScrollIndicator = false
         canvas.showsHorizontalScrollIndicator = false
-
-        // Phase B: 应用初始工具
-        canvas.tool = tool
-
-        // Phase B: Apple Pencil double tap（UIPencilInteraction）
-        context.coordinator.installPencilInteraction(on: canvas)
-
-        // Phase A: 恢复本地已保存笔迹
-        if let annotation = context.coordinator.store?.loadAnnotationSync(entityId: entityId) {
-            canvas.drawing = (try? PKDrawing(data: annotation)) ?? PKDrawing()
-            if !canvas.drawing.strokes.isEmpty {
-                onInkPresenceChanged(true)
+        // 关闭悬停（Pencil hover）手势对绘图的干扰
+        DispatchQueue.main.async {
+            for g in canvas.gestureRecognizers ?? [] {
+                if String(describing: type(of: g)).lowercased().contains("hover") {
+                    g.isEnabled = false
+                }
             }
         }
-        context.coordinator.canvas = canvas
-
-        #if DEBUG
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            context.coordinator.reportGeometry()
+        // 恢复本地已保存笔迹（PKDrawing vector 是真源）
+        if let annotation = context.coordinator.store?.loadAnnotationSync(entityId: entityId) {
+            canvas.drawing = (try? PKDrawing(data: annotation)) ?? PKDrawing()
         }
-        #endif
-
+        context.coordinator.canvas = canvas
         return canvas
     }
 
@@ -268,67 +157,20 @@ struct InkLayerView: UIViewRepresentable {
             context.coordinator.canvas = canvas
             context.coordinator.reloadDrawing()
         }
-        // Phase B: 工具版本变化 → 更新 canvas.tool（stroke active 时已被上层排队）
-        if context.coordinator.toolVersion != toolVersion {
-            context.coordinator.toolVersion = toolVersion
-            canvas.tool = tool
-        }
-        // Phase A: 强制锁定几何不变量
-        if canvas.zoomScale != 1 { canvas.zoomScale = 1 }
-        if canvas.transform != .identity { canvas.transform = .identity }
-        if canvas.contentOffset != .zero { canvas.contentOffset = .zero }
-        if canvas.contentInset != .zero { canvas.contentInset = .zero }
-
-        #if DEBUG
-        context.coordinator.reportGeometry()
-        #endif
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(
-            entityId: entityId,
-            toolVersion: toolVersion,
-            onDrawingChange: onDrawingChange,
-            onInkPresenceChanged: onInkPresenceChanged,
-            onStrokeStateChange: onStrokeStateChange,
-            onDoubleTap: onDoubleTap,
-            isPencilActive: $isPencilActive,
-            onGeometryUpdate: onGeometryUpdate
-        )
-    }
+    func makeCoordinator() -> Coordinator { Coordinator(entityId: entityId, onDrawingChange: onDrawingChange) }
 
-    final class Coordinator: NSObject, PKCanvasViewDelegate, UIPencilInteractionDelegate {
+    final class Coordinator: NSObject, PKCanvasViewDelegate {
         var entityId: String
-        var toolVersion: Int
         var canvas: PKCanvasView?
         var onDrawingChange: (Data) -> Void
-        var onInkPresenceChanged: (Bool) -> Void
-        var onStrokeStateChange: (Bool) -> Void
-        var onDoubleTap: () -> Void
-        @Binding var isPencilActive: Bool
         var store: LocalAnnotationCache? = LocalAnnotationCache.shared
         private var saveTimer: Timer?
-        private var hadInk = false
-        var onGeometryUpdate: ((GeometryDebugData) -> Void)?
 
-        init(
-            entityId: String,
-            toolVersion: Int,
-            onDrawingChange: @escaping (Data) -> Void,
-            onInkPresenceChanged: @escaping (Bool) -> Void,
-            onStrokeStateChange: @escaping (Bool) -> Void,
-            onDoubleTap: @escaping () -> Void,
-            isPencilActive: Binding<Bool>,
-            onGeometryUpdate: ((GeometryDebugData) -> Void)?
-        ) {
+        init(entityId: String, onDrawingChange: @escaping (Data) -> Void) {
             self.entityId = entityId
-            self.toolVersion = toolVersion
             self.onDrawingChange = onDrawingChange
-            self.onInkPresenceChanged = onInkPresenceChanged
-            self.onStrokeStateChange = onStrokeStateChange
-            self.onDoubleTap = onDoubleTap
-            self._isPencilActive = isPencilActive
-            self.onGeometryUpdate = onGeometryUpdate
         }
 
         func reloadDrawing() {
@@ -340,41 +182,8 @@ struct InkLayerView: UIViewRepresentable {
             }
         }
 
-        // MARK: - Pencil double tap
-
-        func installPencilInteraction(on canvas: PKCanvasView) {
-            let interaction = UIPencilInteraction()
-            interaction.delegate = self
-            interaction.isEnabled = true
-            canvas.addInteraction(interaction)
-        }
-
-        func pencilInteractionDidTap(_ interaction: UIPencilInteraction) {
-            // 系统 Pencil double tap → 交给上层（InkToolController 处理 switchEraser）
-            onDoubleTap()
-        }
-
-        // MARK: - Stroke state（Phase A gate + Phase B 工具切换排队）
-
-        func canvasViewDidBeginUsingTool(_ canvasView: PKCanvasView) {
-            isPencilActive = true
-            onStrokeStateChange(true)
-        }
-
-        func canvasViewDidEndUsingTool(_ canvasView: PKCanvasView) {
-            isPencilActive = false
-            onStrokeStateChange(false)
-        }
-
-        // MARK: - Drawing change
-
+        /// debounce 只优化 I/O；页面离开/后台强制 flush（ScenePhase 由外层处理 flushOutbox）
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-            let hasInk = !canvasView.drawing.strokes.isEmpty
-            if hasInk && !hadInk {
-                hadInk = true
-                onInkPresenceChanged(true)
-            }
-
             saveTimer?.invalidate()
             saveTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: false) { [weak self] _ in
                 guard let self, let canvas = self.canvas else { return }
@@ -382,40 +191,11 @@ struct InkLayerView: UIViewRepresentable {
                 self.store?.cache(entityId: self.entityId, data: data)
                 self.onDrawingChange(data)
             }
-
-            #if DEBUG
-            reportGeometry()
-            #endif
         }
-
-        #if DEBUG
-        func reportGeometry() {
-            guard let canvas else { return }
-            let data = GeometryDebugData(
-                canvasFrame: canvas.frame,
-                canvasBounds: canvas.bounds,
-                canvasContentSize: canvas.contentSize,
-                canvasContentOffset: canvas.contentOffset,
-                canvasContentInset: canvas.contentInset,
-                canvasZoomScale: canvas.zoomScale,
-                canvasTransform: canvas.transform,
-                bodySize: canvas.superview?.bounds.size ?? .zero,
-                profileId: "canvas"
-            )
-            onGeometryUpdate?(data)
-
-            assert(canvas.transform == .identity, "PKCanvasView transform must be identity")
-            assert(abs(canvas.zoomScale - 1) < 0.001, "PKCanvasView zoomScale must be 1")
-            assert(canvas.contentOffset == .zero, "PKCanvasView contentOffset must be zero")
-            assert(canvas.contentInset == .zero, "PKCanvasView contentInset must be zero")
-        }
-        #else
-        func reportGeometry() {}
-        #endif
     }
 }
 
-/// 进程内笔迹缓存：同步读取
+/// 进程内笔迹缓存：同步读取（避免 async 穿透 UIViewRepresentable）
 final class LocalAnnotationCache {
     static let shared = LocalAnnotationCache()
     private var cache: [String: Data] = [:]
