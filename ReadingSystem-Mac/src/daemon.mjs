@@ -19,6 +19,7 @@ import { LlmClient } from './ai/llm-client.mjs';
 import { ParserPipeline } from './parser/pipeline.mjs';
 import { InterestEngine, TimingEngine, Scheduler } from './interest/engines.mjs';
 import { ReadingBridge } from './bridge/bridge-server.mjs';
+import { SemanticService } from './semantic/semantic-service.mjs';
 import { newId, nowIso } from './util.mjs';
 
 class Logger {
@@ -67,8 +68,9 @@ export class ReadingDaemon {
     this.db.setMeta('boot_id', this.bootId);
     this.db.setMeta('machine_id', machineId());
 
-    // 4. Prompt runtime
-    this.llm = new LlmClient({ ...this.config.llmConfig(), logger: this.log });
+    // 4. Semantic Service（v2：模式/执行者解耦；Prompt runtime）
+    this.semantic = new SemanticService({ config: this.config, db: this.db, logger: this.log });
+    this.llm = this.semantic.externalClient;   // EXTERNAL_API 通道（可用性由 semantic 状态决定）
     this.promptRegistry = new PromptRegistry({ config: this.config, db: this.db, logger: this.log });
     let promptState = 'OK';
     try {
@@ -94,8 +96,12 @@ export class ReadingDaemon {
     });
     this.builders = new ContextBuilders({ core: this.core, store: this.store, db: this.db });
     this.modules = new AiModules({ llm: this.llm, registry: this.promptRegistry, builders: this.builders, core: this.core, logger: this.log });
-    this.qaTurn = new QaTurnEngine({ core: this.core, modules: this.modules, builders: this.builders, db: this.db, llm: this.llm, logger: this.log });
-    this.enricher = new ParserEnricher({ modules: this.modules, builders: this.builders, registry: this.promptRegistry, logger: this.log });
+    this.syncSemanticChannel();   // route → modules/enricher.useExternal
+    this.qaTurn = new QaTurnEngine({ core: this.core, modules: this.modules, builders: this.builders, db: this.db, llm: this.llm, logger: this.log, semantic: this.semantic });
+    this.enricher = new ParserEnricher({ modules: this.modules, builders: this.builders, registry: this.promptRegistry, logger: this.log, semantic: this.semantic });
+    // parser 的语义通道与 semantic 状态联动
+    this.semantic.enricherSync = () => { this.enricher.useExternal = this.semantic.executionRoute().executor === 'EXTERNAL_API'; };
+    this.qaTurn.enricherSync = () => this.semantic.enricherSync();
 
     // graphInitializer：每 Block 唯一创建初始 ContentGraph
     const graphInitializer = (block) => {
@@ -139,10 +145,14 @@ export class ReadingDaemon {
     }
     this.core.capabilities = {
       core_query: true, core_command: true, graph_mutation: this.core.systemState !== 'SAFE_MODE',
-      parse: true, bridge: Boolean(this.bridge), llm: this.llm.enabled,
+      parse: true, bridge: Boolean(this.bridge),
+      semantic: this.semantic.overview(),
     };
+    this.core.semantic = this.semantic;   // Core API 注册用
+    this.core.daemonSync = () => this.syncSemanticChannel();
     this.startedAt = Date.now();
-    this.log.info(`READY（${Date.now() - t0}ms）。LLM: ${this.llm.enabled ? this.llm.model : '启发式模式（未配置 Key）'}；Prompt: ${promptState}`);
+    const sem = this.semantic.state();
+    this.log.info(`READY（${Date.now() - t0}ms）。Semantic: ${sem.requested_mode} → ${sem.runtime_status}（executor: ${sem.active_executor ?? 'none'}）；Prompt: ${promptState}`);
     return this;
   }
 
@@ -158,11 +168,20 @@ export class ReadingDaemon {
 
   async stop() {
     this.log.info('ReadingDaemon 停止');
+    this.semantic?.stop?.();
     this.bridge?.stopAdvertise?.();
     await this.bridge?.stop?.();
     this.db?.close();
     markCleanShutdown(this.config, this.bootId);
     try { existsSync(path.join(this.config.runtimeDir, 'daemon.pid')) && (await import('node:fs')).rmSync(path.join(this.config.runtimeDir, 'daemon.pid')); } catch { /* ignore */ }
+  }
+
+  /** 按 semantic 执行路由同步外部执行通道（EXTERNAL_API → useExternal=true） */
+  syncSemanticChannel() {
+    const route = this.semantic?.executionRoute?.();
+    const useExternal = route?.executor === 'EXTERNAL_API';
+    if (this.modules) this.modules.useExternal = useExternal;
+    if (this.enricher) { this.enricher.useExternal = useExternal; this.enricher.syncChannel?.(); }
   }
 
   /** 生成一次性配对码 */

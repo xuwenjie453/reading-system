@@ -15,7 +15,7 @@ export class LlmClient {
   }
 
   async chat({ system, user, json = false, maxTokens = 2000, temperature = 0.4, timeoutMs = 60000 }) {
-    if (!this.enabled) throw err.dependency('LLM_NOT_CONFIGURED', '未配置 LLM API Key，处于启发式模式');
+    if (!this.enabled) throw err.dependency('EXTERNAL_PROVIDER_NOT_CONFIGURED', 'External Provider 未配置或未激活');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -46,7 +46,7 @@ export class LlmClient {
       if (typeof text !== 'string') throw err.schema('LLM_BAD_RESPONSE', 'LLM 返回缺少 content');
       return text;
     } catch (e) {
-      if (e.name === 'AbortError') throw err.dependency('LLM_TIMEOUT', 'LLM 请求超时', '重试或改用启发式模式');
+      if (e.name === 'AbortError') throw err.dependency('LLM_TIMEOUT', 'External 请求超时', '可重试');
       throw e;
     } finally {
       clearTimeout(timer);
@@ -58,7 +58,7 @@ export class LlmClient {
     try {
       return JSON.parse(extractJson(text));
     } catch (e) {
-      throw err.schema('LLM_JSON_INVALID', `LLM 输出不是合法 JSON: ${e.message}`, 'limited retry，再失败则 no mutation');
+      throw err.schema('LLM_JSON_INVALID', `执行者输出不是合法 JSON: ${e.message}`, 'limited retry，再失败则 no mutation');
     }
   }
 }

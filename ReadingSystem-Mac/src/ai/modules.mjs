@@ -1,6 +1,8 @@
 // modules.mjs — AI 模块执行器：每个 role 保持独立 contract（即使合并模型调用也保持逻辑边界）
 // 输出验证顺序（02_MacBook端系统/04）：schema validation → deterministic policy validation → commit。
-// 无 LLM 时进入启发式模式：保守、可解释、边界情况一律向 NO_OP 退让（policy.fail_safe）。
+// v2：不再用 llm.enabled 静默决定模式。useExternal 由 SemanticService 的执行路由显式注入：
+//   route=EXTERNAL_API → useExternal=true；route=HEURISTIC → false。
+//   FULL+HOST_AGENT 不经过本模块（由 Host 通过 Work Broker 执行），WAITING 时禁止调用本层。
 import { extractJson, validateSchema } from './llm-client.mjs';
 import { estimateTokens } from '../util.mjs';
 import { err } from '../errors.mjs';
@@ -39,11 +41,12 @@ export const CURATOR_SCHEMA = {
 
 export class AiModules {
   constructor({ llm, registry, builders, core, logger }) {
-    this.llm = llm;
+    this.llm = llm;                 // EXTERNAL_API 客户端（由 SemanticService 构造/重建）
     this.registry = registry;
     this.builders = builders;
     this.core = core;
     this.log = logger;
+    this.useExternal = false;       // 显式执行通道：EXTERNAL_API 时才 true
   }
 
   module(promptId) {
@@ -52,7 +55,7 @@ export class AiModules {
 
   // ================= Responder =================
   async responder({ context, question }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       const system = [
         this.module('runtime.master'),
         this.module('module.responder'),
@@ -74,7 +77,7 @@ export class AiModules {
   }
 
   async curator({ context, turnContext, graphCatalog, question, answer }) {
-    if (!this.llm.enabled) {
+    if (!this.useExternal) {
       return heuristicCurator({ turnContext, question, answer, focusEntity: null, graphCatalog, thresholds: this.curatorThresholds() });
     }
     const system = [
@@ -123,7 +126,7 @@ export class AiModules {
 
   // ================= Segment Writer =================
   async segmentWriter({ decision, question, answer, focusEntity, context }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       const system = this.module('module.segment_writer');
       const user = [
         `已批准的 segment_seed：\n${decision.segment_seed ?? ''}`,
@@ -138,7 +141,7 @@ export class AiModules {
 
   // ================= Node Title / Summary =================
   async nodeTitle({ decision, firstSegment, parentContext }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       const system = this.module('module.node_title');
       const user = `Cognitive Delta：\n${JSON.stringify(decision.cognitive_delta)}\n\nSegment001：\n${String(firstSegment).slice(0, 1200)}\n\n${parentContext ?? ''}\n只输出一行标题。`;
       const text = await this.llm.chat({ system, user, maxTokens: 60, temperature: 0.3 });
@@ -148,7 +151,7 @@ export class AiModules {
   }
 
   async nodeSummary({ node, newSegment, decision, parentContext, mode }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       const system = this.module('module.node_summary');
       const user = mode === 'CREATE'
         ? `为新 Node 生成初始 Anchor Summary（60–150 中文字）。\nTitle：${node.title}\nSegment001：${String(newSegment).slice(0, 1500)}\n${parentContext ?? ''}\n输出 JSON：{"summary":"...","needs_full_reanchor":false}`
@@ -161,7 +164,7 @@ export class AiModules {
 
   // ================= Block Title / Summary（parser 用） =================
   async blockTitleSummary({ content, structuralPath, docTitle, ordinal }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       const titleSys = this.module('module.block_title');
       const sumSys = this.module('module.block_summary');
       const excerpt = String(content).slice(0, 3000);
@@ -179,7 +182,7 @@ export class AiModules {
 
   // ================= Genre（parser 用） =================
   async classifyGenre({ docTitle, sampleText, structuralHints }) {
-    if (this.llm.enabled) {
+    if (this.useExternal) {
       try {
         const system = this.module('parser.genre');
         const user = `只输出 JSON：{"profile":"THEORETICAL|ACADEMIC|TEXTBOOK|FICTION|ESSAY|POETRY|GENERAL","confidence":0-1,"signals":[],"segmentation_hints":[]}\n文档：${docTitle ?? ''}\n样本：\n${String(sampleText).slice(0, 2000)}`;
@@ -256,7 +259,7 @@ export function heuristicResponder(context, question) {
     return `我在当前阅读上下文中没有找到与这个问题直接相关的内容。如果你在问书里的具体内容，可以翻到相关页面后再问，或者换个说法引用一下原文关键词。`;
   }
   const lines = top.map((t) => `- ${t.sent}`);
-  return `根据当前阅读内容，与你的问题相关的部分是：\n${lines.join('\n')}\n\n（当前为启发式摘要模式：以上摘自原文/认知记录的相关句子；配置 LLM API Key 后可获得完整语义回答。）`;
+  return `根据当前阅读内容，与你的问题相关的部分是：\n${lines.join('\n')}\n\n（当前为 HEURISTIC 语义模式：以上摘自原文/认知记录的相关句子；如需完整语义请将 Semantic Mode 设为 Full 并提供执行者。）`;
 }
 
 export function heuristicCurator({ turnContext, question, answer, focusEntity, graphCatalog, thresholds }) {

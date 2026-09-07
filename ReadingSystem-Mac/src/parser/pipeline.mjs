@@ -148,7 +148,7 @@ export class ParserPipeline {
 
     // Stage 3-5: extract(normalized above) → structure tree → segmentation
     const structure = buildStructuralTree(norm.ordered_units);
-    const genre = this.enricher.classifyGenre(norm); // AI role: parser.genre（无 LLM 时 heuristic）
+    const genre = await this.enricher.classifyGenre(norm); // AI role: parser.genre（v2 路由）
     const drafts = segmentDraftBlocks(norm.ordered_units, { genreProfile: genre.profile });
     const reviewed = this.enricher.reviewBlocks(norm, drafts); // AI role: parser.block_reviewer（KEEP/MERGE/RESPLIT）
 

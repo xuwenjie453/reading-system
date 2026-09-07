@@ -26,6 +26,20 @@ function daemonSingleton() {
   return new ReadingDaemon(workspace);
 }
 
+function printQaResult(r) {
+  if (!r) { console.log('（无返回结果）'); return; }
+  if (r.status === 'WAITING_FOR_EXECUTOR' || !r.answer) {
+    console.log(r.note || r.answer || '（等待执行者中）');
+    return;
+  }
+  console.log(`\n${r.answer}\n`);
+  for (const n of r.notes ?? []) console.log(`— ${n}`);
+  if (r.curator) {
+    const extra = r.mutation ? `（已 commit: ${r.mutation.type} ${r.mutation.node_id ?? ''}）` : '';
+    console.log(`— 结构决策: ${r.curator.decision}${extra}`);
+  }
+}
+
 async function main() {
   switch (command) {
     case 'init': {
@@ -116,12 +130,22 @@ async function main() {
     case 'ask': {
       const question = positional.join(' ');
       if (!question) { console.error('用法: ask "<问题>"'); process.exit(1); }
+      // 长驻 daemon（serve-core）优先：QA Turn 在 daemon 内执行，语义 work 与 Host 同进程协同
+      const daemonUrl = process.env.READINGSYSTEM_DAEMON || 'http://127.0.0.1:8731';
+      try {
+        const res = await fetch(`${daemonUrl}/qa`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ kind: 'qa', params: { question, opts: { waitMs: 150000 } } }),
+        });
+        const body = await res.json();
+        if (body.ok) { printQaResult(body.result); break; }
+        if (body.code === 'CONNECTION_REFUSED') throw new Error('not running');
+      } catch { /* 无长驻 daemon → 本地执行 */ }
       const daemon = daemonSingleton();
       await daemon.start({ withBridge: false });
-      const r = await daemon.qaTurn.submitQuestion(question);
-      console.log(`\n${r.answer}\n`);
-      for (const n of r.notes) console.log(`— ${n}`);
-      if (r.curator) console.log(`— 结构决策: ${r.curator.decision}${r.mutation ? `（已 commit: ${r.mutation.type} ${r.mutation.node_id ?? r.mutation.node_id}）` : ''}`);
+      const r = await daemon.qaTurn.submitQuestion(question, { waitMs: 150000 });
+      printQaResult(r);
       await daemon.stop();
       break;
     }
@@ -171,6 +195,53 @@ async function main() {
       break;
     }
 
+    case 'semantic': {
+      // 语义模式/执行策略管理（v2）
+      const daemon = daemonSingleton();
+      await daemon.start({ withBridge: false });
+      const sub = positional[0] || 'status';
+      try {
+        if (sub === 'status') {
+          console.log(JSON.stringify(daemon.semantic.overview(), null, 2));
+        } else if (sub === 'mode') {
+          const value = positional[1];
+          if (!value) throw new Error('用法: semantic mode FULL|HEURISTIC');
+          const st = daemon.semantic.setMode({ mode: value.toUpperCase() });
+          console.log(JSON.stringify(st, null, 2));
+        } else if (sub === 'policy') {
+          const value = positional[1];
+          if (!value) throw new Error('用法: semantic policy HOST_ONLY|HOST_PREFERRED|AUTO|EXTERNAL_ONLY');
+          const st = daemon.semantic.setMode({ execution_policy: value.toUpperCase() });
+          console.log(JSON.stringify(st, null, 2));
+        } else if (sub === 'fallback') {
+          const value = positional[1];
+          if (!value) throw new Error('用法: semantic fallback WAIT_FOR_EXECUTOR|ALLOW_HEURISTIC');
+          const st = daemon.semantic.setMode({ fallback_policy: value.toUpperCase() });
+          console.log(JSON.stringify(st, null, 2));
+        } else if (sub === 'external') {
+          const action = positional[1];
+          if (action === 'configure') {
+            const key = positional[2];
+            const st = daemon.core.command('semantic_external_configure', { api_key: key, enabled: hasFlag('enable') }, { actor: 'cli' });
+            console.log(JSON.stringify(st, null, 2));
+          } else if (action === 'on') {
+            console.log(JSON.stringify(daemon.core.command('semantic_external_enable', {}, { actor: 'cli' }), null, 2));
+          } else if (action === 'off') {
+            console.log(JSON.stringify(daemon.core.command('semantic_external_disable', {}, { actor: 'cli' }), null, 2));
+          } else if (action === 'status') {
+            console.log(JSON.stringify(daemon.core.query('external_provider_status'), null, 2));
+          } else {
+            throw new Error('用法: semantic external configure <key> | on | off | status');
+          }
+        } else {
+          throw new Error('用法: semantic status | mode <FULL|HEURISTIC> | policy <HOST_ONLY|HOST_PREFERRED|AUTO|EXTERNAL_ONLY> | fallback <WAIT_FOR_EXECUTOR|ALLOW_HEURISTIC> | external configure|on|off|status');
+        }
+      } finally {
+        await daemon.stop();
+      }
+      break;
+    }
+
     case 'serve-core': {
       const daemon = new ReadingDaemon(workspace);
       await daemon.start({ withBridge: true });
@@ -185,9 +256,15 @@ async function main() {
         for await (const chunk of req) body += chunk;
         try {
           const { kind, name, params } = JSON.parse(body || '{}');
-          const result = kind === 'command'
-            ? daemon.core.command(name, params ?? {}, { actor: 'http' })
-            : daemon.core.query(name, params ?? {});
+          let result;
+          if (kind === 'command') {
+            result = await daemon.core.command(name, params ?? {}, { actor: 'http' });
+          } else if (kind === 'qa') {
+            // QA Turn 在长驻 daemon 内执行：语义 work 与 Host（rs-agent）同进程协同
+            result = await daemon.qaTurn.submitQuestion(String(params?.question || ''), params?.opts ?? {});
+          } else {
+            result = daemon.core.query(name, params ?? {});
+          }
           res.end(JSON.stringify({ ok: true, result }));
         } catch (e) {
           res.statusCode = 400;
@@ -214,8 +291,9 @@ async function main() {
   scan                  扫描资料库
   parse [all|文件路径]  解析（--force 强制重解析）
   documents             已解析文档列表
-  ask "<问题>"          单条 QA（含 Curator 结构更新）
+  ask "<问题>"          单条 QA（语义路由：HEURISTIC/EXTERNAL 同步；HOST 走 Work Broker）
   chat                  QA 交互模式（/next /end /skip /temporal）
+  semantic             语义模式/执行策略/External（status|mode|policy|fallback|external）
   serve-core            守护进程 + loopback HTTP API
 
 工作区: ${workspace}`);

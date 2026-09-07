@@ -68,9 +68,19 @@ v1 不做：跨图知识图谱 / merge/reparent / 自动 OCR / 多设备 CRDT
 └── ReadingSystem-iPad/        成果 B：iPad 客户端（详见其 README）
 ```
 
-## 已知边界（v1 范围内，如实说明）
+## 语义模式（v2：FULL ≠ API Key）
 
-- **LLM 未配置时**运行在启发式模式：回答为原文摘录、Curator 极保守（几乎只 NO_OP/EXTEND）。配置 `readingsystem.config.json` 里的 LLM Key 后即为完整语义体验。
+```
+FULL Semantic Mode = 合格 Semantic Executor（HOST_AGENT 或 EXTERNAL_API）
+HEURISTIC          = 独立模式（用户显式选择），不是 FULL 的静默降级
+```
+
+- **HOST_AGENT 一等化**：ZCode / Codex 等 Agent 通过 `ReadingSystem-Mac/bin/rs-agent.mjs`（attach → claim work → 执行阅读系统提示词 → submit 结构化结果）成为完整语义执行者，**不需要任何 API Key**；品牌不参与判定，Tier 由 capability probe 决定。
+- **External API 只是可选执行者**：key 只存 macOS Keychain（不进 config/log/Prompt）；策略 HOST_ONLY / HOST_PREFERRED / AUTO / EXTERNAL_ONLY；升级迁移绝不因发现旧 key 自动产生外部调用（NoSurpriseBilling）。
+- FULL 请求无执行者 → `WAITING_FOR_EXECUTOR`（daemon/iPad 保持 READY），不自动降级；除非显式 `semantic fallback ALLOW_HEURISTIC`。
+- 多 Host 通过 claim/lease 抢占语义 work，幂等提交保证 Canonical side effect 只有一次。
+
+快速体验：`semantic status` / `semantic mode FULL` / `rs-agent attach` / `rs-agent work list`。
 - **PDF**：带可读文本层的 PDF 可解析；嵌入字体 CID 编码的 PDF 会被质量闸门明确拒绝（提示换 EPUB），不产出乱码数据。
 - **iPad 真机验收**：Pencil 落笔即写、Ink 长期稳定（EXTEND 零位移）必须在真实 iPad + Apple Pencil 上验收（模拟器不作为 Pencil Gate）。
 - Xcode 首次使用需在终端执行一次 `sudo xcodebuild -runFirstLaunch` 安装系统组件。

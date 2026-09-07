@@ -61,12 +61,30 @@ node bin/readingsystem.mjs pair "我的iPad"    # 6 位配对码，iPad 端输�
 └── readingsystem.config.json      用户配置（LLM Key 等）
 ```
 
+## 语义模式（v2：FULL ≠ API Key）
+
+```bash
+node bin/readingsystem.mjs semantic status              # 模式/执行者/可用性
+node bin/readingsystem.mjs semantic mode FULL           # FULL 或 HEURISTIC
+node bin/readingsystem.mjs semantic policy AUTO         # HOST_ONLY|HOST_PREFERRED|AUTO|EXTERNAL_ONLY
+node bin/readingsystem.mjs semantic fallback ALLOW_HEURISTIC   # 显式允许回退（默认 WAIT_FOR_EXECUTOR）
+node bin/readingsystem.mjs semantic external configure <key>  # Keychain 存凭证（optional）
+```
+
+- Host Agent 接入（零 API Key）：`node bin/rs-agent.mjs attach` → daemon 状态 READY_HOST；
+  Agent 通过 `rs-agent work list/claim` 认领语义工作，执行阅读系统提示词后
+  `rs-agent work submit --file result.json` 提交结构化结果（方向唯一：Agent 主动 claim）。
+- 语义运行状态与 daemon/iPad 健康分离：Host 离线不影响 Store/Bridge/iPad。
+- 旧 `llm.apiKey` 配置自动迁移：凭证入 Keychain、从 config 移除、外部调用不自动启用。
+
 ## 测试
 
 ```bash
-npm test        # 23 项：Graph 不变量 / 幂等重放 / 深度门槛 / Focus 派生 / Timing 锚点 /
-                #      解析 / QA Turn / journal 崩溃恢复 / 端到端（真实 WebSocket 模拟 iPad：
-                #      配对→快照→VIEW_COMMITTED→stale nav 不抢页→duplicate one-effect）
+npm test        # 33 项：Graph 不变量 / 幂等重放 / 深度门槛 / Focus 派生 / Timing 锚点 /
+                #      解析 / QA Turn / journal 崩溃恢复 / 端到端（真实 WebSocket 模拟 iPad）+
+                #      HostAgent v2 验收（A-H + Release Blockers：FULL 无 Key / Host 切换与离线 /
+                #      Background parse 经 Host works / Tier B 不假执行 / 重复提交一次 effect /
+                #      config 迁移 NoSurpriseBilling）
 ```
 
 ## 运行库提示词

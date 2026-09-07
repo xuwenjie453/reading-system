@@ -72,7 +72,7 @@ export class ReadingCore {
       focus_authority: this.focusAuthority(),
       active_prompt_profile: this.promptRuntime?.activeProfileSummary() ?? null,
       last_parse_job: this.lastParseJobId ? this.db.getParseJob(this.lastParseJobId) : null,
-      capabilities: this.capabilities,
+      capabilities: { ...this.capabilities, semantic: this.semantic?.overview?.() ?? this.capabilities.semantic ?? null },
       degraded: this.degraded,
       time: nowIso(),
     };
@@ -105,6 +105,11 @@ export class ReadingCore {
         if (!d) throw err.notFound('DECISION_NOT_FOUND', '未找到该决策记录');
         return d;
       }
+      case 'get_semantic_state': return this.semantic.overview();
+      case 'list_host_sessions': return { sessions: this.semantic.hosts.listSessions() };
+      case 'work_list': return { works: this.semantic.broker.list(params) };
+      case 'work_get': return { work: this.semantic.broker.get(params.work_id) };
+      case 'external_provider_status': return this.semantic.providerAvailability();
       default:
         throw err.validation('UNKNOWN_QUERY', `未知 Query: ${name}`);
     }
@@ -302,9 +307,65 @@ export class ReadingCore {
       case 'activate_profile_snapshot': return this.promptRuntime.activateSnapshot(p.snapshot_id);
       case 'rollback_profile': return this.promptRuntime.rollback(p.snapshot_id);
 
+      // --- v2 Semantic（Host Agent 一等化）---
+      case 'semantic_set_policy': return this.semantic.setMode(p);
+      case 'semantic_external_configure': return this.configureExternal(p);
+      case 'semantic_external_enable': return this.semantic.setExternalEnabled({ enabled: true });
+      case 'semantic_external_disable': return this.semantic.setExternalEnabled({ enabled: false });
+      case 'agent_attach': return this.agentAttach(p);
+      case 'agent_heartbeat': return this.semantic.hosts.heartbeat(p.session_token);
+      case 'agent_detach': return this.agentDetach(p);
+      case 'work_claim': return this.workClaim(p);
+      case 'work_submit': return this.workSubmit(p);
+
       default:
         throw err.validation('UNKNOWN_COMMAND', `未知 Command: ${name}`);
     }
+  }
+
+  // ---- v2 Semantic handlers ----
+  configureExternal(p) {
+    if (p.api_key) {
+      const saved = this.semantic.credentials.save(p.api_key, { source: 'cli' });
+      if (!saved.ok) throw err.dependency('KEYCHAIN_WRITE_FAILED', '无法将凭证写入 Keychain', '检查 macOS 钥匙串访问权限');
+    }
+    const st = this.semantic.setExternalEnabled({ enabled: p.enabled ?? this.semantic.credentials.hasCredential() });
+    this.syncChannelAfterSemanticChange();
+    return { credential_stored: Boolean(p.api_key), semantic: st };
+  }
+
+  agentAttach(p) {
+    // probe 五项的缺省视为 host 已回传（由 rs-agent probe 实际执行后 attach 携带）
+    const res = this.semantic.hosts.attach(p);
+    this.syncChannelAfterSemanticChange();
+    return res;
+  }
+
+  agentDetach(p) {
+    const res = p.session_token
+      ? this.semantic.hosts.detach({ session_id: this.semantic.hosts.byToken(p.session_token).agent_session_id, reason: p.reason || 'DETACH' })
+      : this.semantic.hosts.detach({ session_id: p.session_id, reason: p.reason || 'DETACH' });
+    this.syncChannelAfterSemanticChange();
+    return res;
+  }
+
+  workClaim(p) {
+    const session = this.semantic.hosts.byToken(p.session_token);
+    const claimed = this.semantic.broker.claim({ session_token: p.session_token, session, max_items: p.max_items ?? 1, work_type: p.work_type ?? null, only_background: Boolean(p.only_background) });
+    if (!claimed.length) return { claimed: [], note: '没有可 claim 的 PENDING work' };
+    return { claimed };
+  }
+
+  workSubmit(p) {
+    const session = this.semantic.hosts.byToken(p.session_token);
+    return this.semantic.broker.submit({
+      work_id: p.work_id, result_id: p.result_id, idempotency: p.idempotency,
+      session, result: p.result, status: p.status || 'ok', error: p.error ?? null,
+    });
+  }
+
+  syncChannelAfterSemanticChange() {
+    if (this.daemonSync) this.daemonSync();
   }
 
   recordCuratorDecision(p) {

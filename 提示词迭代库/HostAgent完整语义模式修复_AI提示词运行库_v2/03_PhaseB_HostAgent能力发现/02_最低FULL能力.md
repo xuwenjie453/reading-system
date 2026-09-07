@@ -1,0 +1,11 @@
+# FULL 最低能力
+
+> 状态：**ACTIVE**  
+> 运行库版本：**v2.0**  
+> 生成日期：**2026-09-07**
+
+Tier A FULL 至少需要：
+PROMPT_EXECUTION
+STRUCTURED_OUTPUT
+READING_CORE_QUERY
+READING_CORE_COMMAND
