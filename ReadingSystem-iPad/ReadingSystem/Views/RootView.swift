@@ -9,8 +9,14 @@ struct RootView: View {
     @State private var viewKind: String = "TOPOLOGY_VIEW"
     @State private var currentNodeId: String?
     @State private var showPairing = false
-    @State private var previousSegmentCount = 0
+    @State private var annotationData: ReaderAnnotationData? = nil
     @Environment(\.scenePhase) private var scenePhase
+
+    private var currentEntityId: String? {
+        if viewKind == "NODE_VIEW" { return currentNodeId }
+        if viewKind == "BLOCK_VIEW" { return sync.snapshot?.rootBlockId }
+        return nil
+    }
 
     var body: some View {
         NavigationStack {
@@ -37,12 +43,19 @@ struct RootView: View {
                         viewKind: viewKind,
                         entity: sync.snapshot?.nodes.first(where: { $0.id == currentNodeId }),
                         snapshot: sync.snapshot,
-                        previousSegmentCount: previousSegmentCount,
-                        annotationHandler: { entityId, data in
+                        annotation: annotationData,
+                        onDrawingChange: { entityId, data, layoutEpoch in
                             if let gid = sync.graphId {
-                                Task { await sync.saveAnnotation(graphId: gid, entityId: entityId, drawingData: data) }
+                                Task { await sync.saveAnnotation(graphId: gid, entityId: entityId,
+                                                                  drawingData: data, layoutEpoch: layoutEpoch) }
                             }
                         })
+                        .task(id: currentEntityId) {
+                            // 进入 Entity 时装载本地批注（含布局锁定信息）
+                            if let entityId = currentEntityId {
+                                annotationData = await sync.loadAnnotation(entityId: entityId)
+                            }
+                        }
                 }
             }
             .toolbar {
@@ -104,7 +117,6 @@ struct RootView: View {
 
     /// 本地优先导航：双击即本地进入并持久化 ViewState（store.commitView），再发 ViewCommitted
     private func enter(viewKind kind: String, entityId: String?, graphId: String? = nil) {
-        previousSegmentCount = sync.snapshot?.nodes.first(where: { $0.id == entityId })?.segmentCount ?? 0
         viewKind = kind
         currentNodeId = entityId
         if let gid = graphId ?? sync.graphId {
@@ -112,6 +124,8 @@ struct RootView: View {
                 await sync.commitLocalView(graphId: gid, viewKind: kind, entityId: entityId)
             }
         }
+        // Entity 切换：清空旧 annotation，等待新装载
+        annotationData = nil
     }
 }
 

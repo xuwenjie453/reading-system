@@ -218,19 +218,28 @@ public final class SyncEngine: ObservableObject {
         await enqueueOutbox(kind: "LayoutPatch", payload: jsonString(payload))
     }
 
+    /// 读取某 Entity 的本地批注（含 layoutEpoch → Reader 布局锁定用）
+    public func loadAnnotation(entityId: String) async -> ReaderAnnotationData? {
+        guard let gid = graphId else { return nil }
+        let bundle = try? await store.loadAnnotation(graphId: gid, entityId: entityId)
+        return ReaderAnnotationData(entityId: entityId, bundle: bundle)
+    }
+
     /// Pencil 落笔后的 Annotation 快照（v1 完整快照，不做 stroke CRDT）
-    public func saveAnnotation(graphId gid: String, entityId: String, drawingData: Data) async {
+    /// layoutEpoch：本次落笔锁定的 LayoutProfile 编码（旧 Ink 永不 reflow 的依据）
+    public func saveAnnotation(graphId gid: String, entityId: String, drawingData: Data, layoutEpoch: String) async {
         let existing = try? await store.loadAnnotation(graphId: gid, entityId: entityId)
         let newRev = (existing?.revision ?? 0) + 1
         let annId = existing?.annotationId ?? ("ann_" + UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: ""))
-        try? await store.saveAnnotation(annotationId: annId, graphId: gid, entityId: entityId, revision: newRev, drawing: drawingData)
+        try? await store.saveAnnotation(annotationId: annId, graphId: gid, entityId: entityId,
+                                        revision: newRev, drawing: drawingData, layoutEpoch: layoutEpoch)
         let payload: [String: JSONValue] = [
             "annotation_id": .string(annId),
             "graph_id": .string(gid),
             "entity_id": .string(entityId),
             "base_revision": .number(Double(newRev - 1)),
             "new_revision": .number(Double(newRev)),
-            "writer": .string(await store.deviceId() ?? "ipad"),
+            "writer": .string((try? await store.deviceId()) ?? "ipad"),
             "drawing_data": .string(drawingData.base64EncodedString()),
         ]
         await enqueueOutbox(kind: "AnnotationSnapshot", payload: jsonString(payload))

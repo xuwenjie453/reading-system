@@ -173,24 +173,31 @@ public actor ClientStore {
     }
 
     // MARK: ANNOTATION（local-first；PKDrawing vector 是真源，PNG 只是缓存）
-    public func saveAnnotation(annotationId: String, graphId: String, entityId: String, revision: Int, drawing: Data) throws {
+    public func saveAnnotation(annotationId: String, graphId: String, entityId: String, revision: Int, drawing: Data, layoutEpoch: String = "v1") throws {
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
-        let sql = "INSERT INTO annotations (annotation_id, graph_id, entity_id, layout_epoch, revision, drawing_data, updated_at) VALUES (?1,?2,?3,'v1',?4,?5,?6) ON CONFLICT(annotation_id) DO UPDATE SET revision = excluded.revision, drawing_data = excluded.drawing_data, updated_at = excluded.updated_at;"
+        let sql = "INSERT INTO annotations (annotation_id, graph_id, entity_id, layout_epoch, revision, drawing_data, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(annotation_id) DO UPDATE SET revision = excluded.revision, drawing_data = excluded.drawing_data, layout_epoch = excluded.layout_epoch, updated_at = excluded.updated_at;"
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { throw StoreError.sqlFailed("ann prepare") }
         sqlite3_bind_text(stmt, 1, (annotationId as NSString).utf8String, -1, nil)
         sqlite3_bind_text(stmt, 2, (graphId as NSString).utf8String, -1, nil)
         sqlite3_bind_text(stmt, 3, (entityId as NSString).utf8String, -1, nil)
-        sqlite3_bind_int(stmt, 4, Int32(revision))
-        sqlite3_bind_blob(stmt, 5, (drawing as NSData).bytes, Int32(drawing.count), nil)
-        sqlite3_bind_text(stmt, 6, (now() as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 4, (layoutEpoch as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(stmt, 5, Int32(revision))
+        sqlite3_bind_blob(stmt, 6, (drawing as NSData).bytes, Int32(drawing.count), nil)
+        sqlite3_bind_text(stmt, 7, (now() as NSString).utf8String, -1, nil)
         guard sqlite3_step(stmt) == SQLITE_DONE else { throw StoreError.sqlFailed("ann step") }
     }
 
-    public func loadAnnotation(graphId: String, entityId: String) throws -> (annotationId: String, revision: Int, drawing: Data)? {
+    public struct AnnotationBundle: Sendable {
+        public let annotationId: String
+        public let revision: Int
+        public let layoutEpoch: String?
+        public let drawing: Data
+    }
+
+    public func loadAnnotation(graphId: String, entityId: String) throws -> AnnotationBundle? {
         let rows = try queryString("SELECT * FROM annotations WHERE graph_id = '\(escape(graphId))' AND entity_id = '\(escape(entityId))' ORDER BY revision DESC LIMIT 1")
         guard let row = rows.first, let annId = row["annotation_id"] else { return nil }
-        // drawing blob 以 hex 不可行 — 单独用 stmt 读取
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(db, "SELECT drawing_data FROM annotations WHERE annotation_id = '\(escape(annId))'", -1, &stmt, nil) == SQLITE_OK,
@@ -198,7 +205,10 @@ public actor ClientStore {
               let bytes = sqlite3_column_blob(stmt, 0) else { return nil }
         let count = Int(sqlite3_column_bytes(stmt, 0))
         let data = Data(bytes: bytes, count: count)
-        return (annId, Int(row["revision"] ?? "0") ?? 0, data)
+        return AnnotationBundle(annotationId: annId,
+                                revision: Int(row["revision"] ?? "0") ?? 0,
+                                layoutEpoch: row["layout_epoch"],
+                                drawing: data)
     }
 
     // MARK: SESSION / ViewState（本地权威；先 durable 再发 ViewCommitted）
